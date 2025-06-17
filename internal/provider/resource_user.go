@@ -148,14 +148,34 @@ func resourceUser() *schema.Resource {
 			"password": {
 				Description: "Stores the password for the user account. A password can contain any combination of " +
 					"ASCII characters. A minimum of 8 characters is required. The maximum length is 100 characters. " +
-					"As the API does not return the value of password, this field is write-only, and the value stored " +
-					"in the state will be what is provided in the configuration. The field is required on create and will " +
-					"be empty on import.",
+					"As the API does not return the value of password, this field is computed after creation or update.",
+				Type:        schema.TypeString,
+				Optional:    true, // Remains optional for initial set if password_wo not used
+				Computed:    true, // Password is now computed, as it's not directly managed by config after creation/update
+				Sensitive:   true,
+				ValidateDiagFunc: validation.ToDiagFunc(validation.StringLenBetween(8, 100)),
+				ConflictsWith: []string{"password_wo"}, // Conflicts with the write-only password
+			},
+			"password_wo": { // New write-only password field
+				Description: "Stores the password for the user account. A password can contain any combination of " +
+					"ASCII characters. A minimum of 8 characters is required. The maximum length is 100 characters. " +
+					"This field is write-only and is used in conjunction with `password_wo_version` to trigger password updates. " +
+					"It will not be stored in the state.",
 				Type:             schema.TypeString,
 				Optional:         true,
 				Sensitive:        true,
+				WriteOnly:        true, // This ensures it's never stored in state
 				ValidateDiagFunc: validation.ToDiagFunc(validation.StringLenBetween(8, 100)),
+				ConflictsWith:    []string{"password"},
+				RequiredWith:     []string{"password_wo_version"},
 			},
+			"password_wo_version": { // New version field for password_wo
+				Description: "An incrementing integer used to trigger updates to `password_wo`. " +
+					"Increment this value to force a new password to be set.",
+				Type:         schema.TypeInt,
+				Optional:     true,
+				RequiredWith: []string{"password_wo"},
+ 			},
 			"hash_function": {
 				Description: "Stores the hash format of the password property. We recommend sending the password " +
 					"property value as a base 16 bit hexadecimal-encoded hash value. Set the hashFunction values " +
@@ -1010,17 +1030,25 @@ func resourceUserCreate(ctx context.Context, d *schema.ResourceData, meta interf
 	// use the meta value to retrieve your client from the provider configure method
 	client := meta.(*apiClient)
 
-	if d.Get("password").(string) == "" {
+	primaryEmail := d.Get("primary_email").(string)
+	log.Printf("[DEBUG] Creating User %q: %#v", d.Id(), primaryEmail)
+
+	// Prioritize password_wo if provided, otherwise use 'password' (for backward compatibility or direct set)
+	var passwordToSet string
+	if v, ok := d.GetOk("password_wo"); ok {
+		passwordToSet = v.(string)
+	} else if v, ok := d.GetOk("password"); ok {
+		passwordToSet = v.(string)
+	}
+
+	if passwordToSet == "" {
 		diags = append(diags, diag.Diagnostic{
 			Severity: diag.Error,
-			Summary:  fmt.Sprintf("Password is required when creating a new user"),
+			Summary:  fmt.Sprintf("Either 'password' or 'password_wo' is required when creating a new user"),
 		})
 
 		return diags
 	}
-
-	primaryEmail := d.Get("primary_email").(string)
-	log.Printf("[DEBUG] Creating User %q: %#v", d.Id(), primaryEmail)
 
 	directoryService, diags := client.NewDirectoryService()
 	if diags.HasError() {
@@ -1034,7 +1062,7 @@ func resourceUserCreate(ctx context.Context, d *schema.ResourceData, meta interf
 
 	userObj := directory.User{
 		PrimaryEmail:               primaryEmail,
-		Password:                   d.Get("password").(string),
+		Password:                   passwordToSet,
 		HashFunction:               d.Get("hash_function").(string),
 		Suspended:                  d.Get("suspended").(bool),
 		ChangePasswordAtNextLogin:  d.Get("change_password_at_next_login").(bool),
@@ -1167,8 +1195,8 @@ func resourceUserRead(ctx context.Context, d *schema.ResourceData, meta interfac
 	}
 
 	d.Set("primary_email", user.PrimaryEmail)
-	// password and hash_function are not returned in the response, so set them to what we defined in the config
-	d.Set("password", d.Get("password"))
++	// Password is a write-only field, and the API does not return it.
++	// We mark it as computed, so Terraform doesn't expect it in the API response for read.
 	d.Set("hash_function", d.Get("hash_function"))
 	d.Set("is_admin", user.IsAdmin)
 	d.Set("is_delegated_admin", user.IsDelegatedAdmin)
@@ -1209,6 +1237,11 @@ func resourceUserRead(ctx context.Context, d *schema.ResourceData, meta interfac
 	d.Set("org_unit_path", user.OrgUnitPath)
 	d.Set("recovery_email", user.RecoveryEmail)
 	d.Set("recovery_phone", user.RecoveryPhone)
+	// Since password and password_wo are write-only/ephemeral,
+	// we ensure that the computed 'password' attribute remains empty in state
+	// while 'password_wo' is never stored due to WriteOnly: true.
+	d.Set("password", "")
+
 
 	d.SetId(user.Id)
 	log.Printf("[DEBUG] Finished getting User %q: %#v", d.Id(), primaryEmail)
@@ -1244,12 +1277,26 @@ func resourceUserUpdate(ctx context.Context, d *schema.ResourceData, meta interf
 		userObj.PrimaryEmail = primaryEmail
 	}
 
-	if d.HasChange("password") {
-		userObj.Password = d.Get("password").(string)
-
-		if userObj.Password == "" {
-			forceSendFields = append(forceSendFields, "Password")
+	// Handle password updates via password_wo and password_wo_version
+	if d.HasChange("password_wo_version") {
+		newPasswordWO := d.Get("password_wo").(string)
+		oldPasswordWOVersion, newPasswordWOVersion := d.GetChange("password_wo_version")
+		
+		// Only send password if password_wo_version has truly incremented or if it's new and set
+		if newPasswordWO != "" && newPasswordWOVersion != oldPasswordWOVersion {
+			userObj.Password = newPasswordWO
+			// We explicitly do not append "Password" to ForceSendFields here
+			// as we're relying on the presence of the password value itself.
 		}
+	} else if d.HasChange("password") {
+		// Fallback for direct 'password' changes (if password_wo is not used)
+		// Note: 'password' is now primarily computed, but for existing configs
+		// or if 'password_wo' is intentionally not used, this path could be relevant.
+		// The general recommendation for ephemeral is to use the _wo pattern.
+		userObj.Password = d.Get("password").(string)
+		// if userObj.Password == "" {
+		// 	forceSendFields = append(forceSendFields, "Password")
+		// }
 	}
 
 	if d.HasChange("hash_function") {

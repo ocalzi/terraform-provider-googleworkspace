@@ -1,4 +1,4 @@
-name: Unit tests
+name: Unit tests and Build
 
 on:
   push:
@@ -9,21 +9,41 @@ on:
       - main
     paths:
       - '**.go'
+
+env:
+  PROVIDER_NAME: googleworkspace # Define your provider's base name
+  GO111MODULE: on # Ensure Go modules are enabled
+
 jobs:
-  unit_tests:
-    runs-on: ubuntu-latest
+  unit_tests_and_build: # Renamed job to reflect new scope
+    runs-on: ${{ matrix.os }}-latest # Use a matrix for OS to build on multiple platforms
+    strategy:
+      matrix:
+        os: [ubuntu, macos, windows] # Build for Linux, macOS, and Windows
+        arch: [amd64, arm64] # Build for AMD64 and ARM64 architectures
+        exclude:
+          # Exclude combinations that are less common or require specific runners not easily available
+          - os: windows
+            arch: arm64 # Windows ARM64 builds are less common for providers
+          - os: macos # Exclude darwin arm64 builds on macos-latest (x64) for simplicity.
+            arch: arm64 # macOS ARM64 might require a dedicated 'macos-arm64' runner or cross-compilation setup which is more complex.
+
     steps:
       - name: Checkout
-        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2 # v4.0.0
+        uses: actions/checkout@v4 # Use v4 for newer features and better compatibility
+
       - name: Set up Go
-        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        uses: actions/setup-go@v5 # Use v5 for newer features and better compatibility
         with:
-          go-version: '1.16'
-        id: go
+          go-version: '1.22' # Recommended to use a modern Go version, compatible with your provider
+
       - name: Go mod verify
         run: go mod verify
 
-      - name: Get credentials
+      # If your unit tests require credentials from Vault, keep this block.
+      # Otherwise, for pure unit tests, you can often remove it for faster runs.
+      # Assuming you still need it based on your original file.
+      - name: Get credentials from Vault
         id: vault
         uses: hashicorp/vault-action@v3.3.0
         with:
@@ -35,8 +55,43 @@ jobs:
           exportEnv: false
           namespace: admin/tpgw
           secrets: |
-                gcp/key/tf-acctest private_key_data
+            gcp/key/tf-acctest private_key_data
+
       - name: Run unit tests
-        run:
-          export GOOGLEWORKSPACE_CREDENTIALS=$(echo -n ${{ steps.vault.outputs.private_key_data }} | base64 --decode)
-          make test
+        run: |
+          # Only set credentials if the step succeeded and output exists
+          if [ "${{ steps.vault.outputs.private_key_data }}" != "" ]; then
+            export GOOGLEWORKSPACE_CREDENTIALS=$(echo -n ${{ steps.vault.outputs.private_key_data }} | base64 --decode)
+          fi
+          make test # Use your existing make test command
+
+      # --- New Build Steps ---
+      - name: Get Version for Build Artifact Naming
+        id: get_build_version
+        run: |
+          # Determine the version string for the compiled binary
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            # This path is mainly for clarity, the `release.yml` will handle the release artifacts
+            echo "build_version=${{ github.ref_name }}" >> $GITHUB_ENV
+          else
+            # For pushes/PRs, use a development version based on the short commit SHA
+            echo "build_version=dev-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+
+      - name: Build Provider Binary
+        run: |
+          # Construct the full binary name including provider name, version, OS, and Architecture
+          BINARY_FULL_NAME="terraform-provider-${{ env.PROVIDER_NAME }}_${{ env.build_version }}_${{ matrix.os }}_${{ matrix.arch }}"
+          # Add .exe extension for Windows binaries
+          if [ "${{ matrix.os }}" == "windows" ]; then
+            BINARY_FULL_NAME="${BINARY_FULL_NAME}.exe"
+          fi
+          # Compile the Go application, specifying the output filename and path
+          go build -ldflags "-s -w" -o "${BINARY_FULL_NAME}" . # Build from the current directory (main package assumed at root)
+
+      - name: Upload Built Artifact
+        uses: actions/upload-artifact@v4 # Use v4 for newer features
+        with:
+          name: ${{ env.PROVIDER_NAME }}-${{ matrix.os }}-${{ matrix.arch }} # Unique name for each artifact bundle
+          # The 'path' must exactly match the filename constructed in the 'Build Provider Binary' step
+          path: terraform-provider-${{ env.PROVIDER_NAME }}_${{ env.build_version }}_${{ matrix.os }}_${{ matrix.arch }}${{ matrix.os == 'windows' && '.exe' || '' }}

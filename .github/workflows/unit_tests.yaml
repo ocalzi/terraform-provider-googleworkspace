@@ -30,13 +30,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4 # Use v4 for newer features and better compatibility
-
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2 # v4.0.0
       - name: Set up Go
-        uses: actions/setup-go@v5 # Use v5 for newer features and better compatibility
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
-          go-version: '1.16' # Recommended to use a modern Go version, compatible with your provider
-
+          go-version: '1.16'
+        id: go
       - name: Go mod verify
         run: go mod verify
 

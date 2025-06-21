@@ -1195,8 +1195,8 @@ func resourceUserRead(ctx context.Context, d *schema.ResourceData, meta interfac
 	}
 
 	d.Set("primary_email", user.PrimaryEmail)
-+	// Password is a write-only field, and the API does not return it.
-+	// We mark it as computed, so Terraform doesn't expect it in the API response for read.
+	// Password is a write-only field, and the API does not return it.
+	// We mark it as computed, so Terraform doesn't expect it in the API response for read.
 	d.Set("hash_function", d.Get("hash_function"))
 	d.Set("is_admin", user.IsAdmin)
 	d.Set("is_delegated_admin", user.IsDelegatedAdmin)
